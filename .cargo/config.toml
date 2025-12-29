@@ -1,0 +1,19 @@
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor"
+#rustflags = [
+#  "-C", "link-arg=-nostartfiles",
+#  "-C", "link-arg=-Wl,-Tlink.x",
+#  "-C", "link-arg=-Wl,-Tmemory.x",
+#]
+
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[unstable]
+build-std = ["core", "alloc"]
+build-std-features = ["panic_immediate_abort"]
+
+[env]
+# Suppress warnings about unused manifest keys
+CARGO_REGISTRIES_CRATES_IO_PROTOCOL = "sparse"
+ESP_HAL_CONFIG_PSRAM_MODE = "octal"
