@@ -78,46 +78,47 @@ pub struct DisplayHardware {
 
 impl DisplayHardware {
     /// Send a frame to the display using DMA transfer
-    /// This method sends the complete frame at once, as required by the DPI interface
+    /// This method sends the complete frame at once, as required by the DPI interface  
     pub fn send_frame(&mut self) -> Result<(), &'static str> {
         // Take ownership of both the display and DMA buffer
         let display = self.display.take()
-            .ok_or("Display not available")?;
+            .ok_or("Display not available - transfer already in progress")?;
         let mut dma_buffer = self.dma_buffer.take()
-            .ok_or("DMA buffer not available")?;
+            .ok_or("DMA buffer not available - transfer already in progress")?;
+        
+        // DEBUG: Check what's in the DMA buffer before sending
+        static mut FIRST_SEND: bool = true;
+        unsafe {
+            if FIRST_SEND {
+                let buf_slice = dma_buffer.as_slice();
+                if buf_slice.len() >= 2 {
+                    let pixel0 = u16::from_le_bytes([buf_slice[0], buf_slice[1]]);
+                    println!("DMA send: first pixel = 0x{:04X} (should be blue ~0x219F)", pixel0);
+                }
+                FIRST_SEND = false;
+            }
+        }
         
         // Set the DMA buffer length to the full frame size
         dma_buffer.set_length(DMA_FRAME_SIZE);
         
-        println!("Sending complete frame to parallel LCD: {}x{} pixels ({} bytes)", 
-                 LCD_H_RES, LCD_V_RES, DMA_FRAME_SIZE);
-        
         // Send the complete frame via DMA to the parallel LCD
         match display.send(false, dma_buffer) {
             Ok(transfer) => {
-                // Wait for the transfer to complete
+                // BLOCKING WAIT - This ensures framebuffer isn't modified during DMA
+                // The transfer takes ~55ms at 10MHz which blocks the executor
                 let (result, display_back, buffer_back) = transfer.wait();
                 
-                // Restore the display and buffer
+                // Restore the display and buffer AFTER transfer completes
                 self.display = Some(display_back);
                 self.dma_buffer = Some(buffer_back);
                 
-                match result {
-                    Ok(()) => {
-                        println!("Complete frame sent successfully to parallel LCD");
-                        Ok(())
-                    }
-                    Err(error) => {
-                        println!("DMA transfer completed with error: {:?}", error);
-                        Err("DMA transfer error")
-                    }
-                }
+                result.map_err(|_| "DMA transfer error")
             }
-            Err((error, display_back, buffer_back)) => {
+            Err((_, display_back, buffer_back)) => {
                 // Restore the display and buffer on error
                 self.display = Some(display_back);
                 self.dma_buffer = Some(buffer_back);
-                println!("Failed to start DMA transfer: {:?}", error);
                 Err("Failed to start DMA transfer")
             }
         }
@@ -179,6 +180,14 @@ pub fn init_display_hardware(
     println!("PSRAM framebuffer allocated: {} bytes for {}x{} frame", 
              DMA_FRAME_SIZE, LCD_H_RES, LCD_V_RES);
     
+    // Initialize framebuffer to PURE RED for testing RGB bit order
+    // RGB565: Pure Red = 0xF800 (11111 000000 00000)
+    println!("Initializing framebuffer to PURE RED for testing...");
+    for pixel in framebuffer.iter_mut() {
+        *pixel = slint::platform::software_renderer::Rgb565Pixel(0xF800); // Pure Red
+    }
+    println!("Framebuffer initialized to RED - if you see blue, RGB order is swapped!");
+    
     // Create DMA buffer that uses the same PSRAM memory as the framebuffer
     // This avoids copying data between framebuffer and DMA buffer
     let framebuffer_bytes: &'static mut [u8] = unsafe {
@@ -207,21 +216,22 @@ pub fn init_display_hardware(
     };
     
     // Create DMA buffer with external burst configuration for PSRAM
+    // Using Size16 for better PSRAM compatibility (reduced from Size64)
     let dma_tx_buf = DmaTxBuf::new_with_config(
         tx_descriptors,
         framebuffer_bytes,
-        ExternalBurstConfig::Size64,
+        ExternalBurstConfig::Size16,
     ).map_err(|_| "Failed to create DMA TX buffer with PSRAM config")?;
 
-    println!("DMA buffer created with PSRAM backing and 64-byte burst config");
+    println!("DMA buffer created with PSRAM backing and 16-byte burst config");
 
     // Parallel LCD initialization using ESP-HAL DPI interface
     let lcd_cam = LcdCam::new(lcd_cam);
     
-    // Configure display timing parameters for ST7262 800x480 @ 21MHz
-    // Using exact parameters from reference firmware
+    // Configure display timing parameters for ST7262 800x480
+    // Optimized to eliminate black flickering with proper sync timing
     let config = DpiConfig::default()
-        .with_frequency(Rate::from_hz(21_000_000)) // 21MHz pixel clock as specified
+        .with_frequency(Rate::from_hz(10_000_000)) // 10MHz for stable, flicker-free operation
         .with_clock_mode(ClockMode {
             polarity: Polarity::IdleHigh, // pclk_idle_high = 1
             phase: Phase::ShiftLow,       // Data valid on falling edge
@@ -232,17 +242,17 @@ pub fn init_display_hardware(
         })
         .with_timing(FrameTiming {
             horizontal_active_width: 800,
-            horizontal_total_width: 800 + 8 + 4 + 8, // Active + front porch + sync + back porch = 820
-            horizontal_blank_front_porch: 8,          // hsync_front_porch = 8
+            horizontal_total_width: 1056, // Standard 800x480 timing: 800 + 210 + 46 blanking
+            horizontal_blank_front_porch: 210,  // Front porch before HSYNC
 
             vertical_active_height: 480,
-            vertical_total_height: 480 + 8 + 4 + 8,  // Active + front porch + sync + back porch = 500
-            vertical_blank_front_porch: 8,            // vsync_front_porch = 8
+            vertical_total_height: 525,   // Standard timing: 480 + 22 + 23 blanking
+            vertical_blank_front_porch: 22,    // Front porch before VSYNC
 
-            hsync_width: 4,                           // hsync_pulse_width = 4
-            vsync_width: 4,                           // vsync_pulse_width = 4
+            hsync_width: 46,              // HSYNC pulse width
+            vsync_width: 23,              // VSYNC pulse width
 
-            hsync_position: 0,
+            hsync_position: 0,            // HSYNC starts at beginning of blanking
         })
         .with_vsync_idle_level(Level::High)  // vsync_polarity = 0 means active low, so idle high
         .with_hsync_idle_level(Level::High)  // hsync_polarity = 0 means active low, so idle high
@@ -358,7 +368,17 @@ pub fn init_display_hardware(
         framebuffer: Some(framebuffer),
     });
 
-    println!("Display hardware initialization complete");
+    println!("Display hardware initialization complete - ready for Slint rendering");
+    
+    // Send one test frame to verify display is working
+    println!("Sending test frame with PURE RED...");
+    DISPLAY_COMPONENTS.with_mut(|hw| {
+        match hw.send_frame() {
+            Ok(_) => println!("Test frame sent! You should see PURE RED screen (or blue if RGB swapped)"),
+            Err(e) => println!("Failed to send test frame: {}", e),
+        }
+    });
+    
     Ok(())
 }
 

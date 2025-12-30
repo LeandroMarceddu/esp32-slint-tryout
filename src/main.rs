@@ -239,22 +239,28 @@ async fn main(spawner: embassy_executor::Spawner) {
 
     // Trigger initial refresh
     ui.invoke_wifi_refresh();
+    
+    // Request initial render of the UI
+    window.request_redraw();
+    println!("Initial UI render requested");
+
+    // Spawn graphics rendering task (handles both rendering AND display output)
+    println!("Spawning graphics rendering task");
+    // TEMPORARILY DISABLED for RGB order testing
+    // spawner
+    //     .spawn(graphics_task(window.clone(), ui.as_weak()))
+    //     .expect("Failed to spawn graphics rendering task");
 
     // Spawn WiFi scanning task
     println!("Spawning WiFi scan task");
-    spawner.spawn(wifi_scan_task(wifi_ctrl)).ok();
+    spawner.spawn(wifi_scan_task(wifi_ctrl))
+        .expect("Failed to spawn WiFi scan task");
 
-    // Spawn graphics rendering task
-    println!("Spawning graphics rendering task");
-    spawner
-        .spawn(graphics_task(window.clone(), ui.as_weak()))
-        .ok();
-
-    // Spawn display DMA task (separate from graphics rendering)
-    println!("Spawning display DMA task");
-    spawner
-        .spawn(display_dma_task())
-        .ok();
+    println!("All tasks spawned successfully");
+    
+    // Give spawned tasks time to start before main enters its loop
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
+    println!("Tasks initialization period complete");
 
     // === Touch Polling Integration ===
     println!("Starting continuous touch polling and Slint integration...");
@@ -265,82 +271,92 @@ async fn main(spawner: embassy_executor::Spawner) {
     let mut last_touch_position = slint::LogicalPosition::new(0.0, 0.0);
 
     loop {
+        // CRITICAL: Await the ticker to yield to other tasks!
+        touch_ticker.next().await;
+        
         // Poll touch events if touch controller is available
         DISPLAY_COMPONENTS.with_mut(|display_hardware| {
-            if let Ok(touch_data_option) = display_hardware.touch.get_touch(&mut display_hardware.i2c) {
-                match (last_touch_state.as_ref(), touch_data_option.as_ref()) {
-                    // Touch press event (transition from None to Some)
-                    (None, Some(touch_data)) => {
-                        let physical_position =
-                            PhysicalPosition::new(touch_data.x as i32, touch_data.y as i32);
-                        let logical_position =
-                            physical_position.to_logical(window.scale_factor());
-                        last_touch_position = logical_position;
-
-                        let pointer_event = WindowEvent::PointerPressed {
-                            position: logical_position,
-                            button: PointerEventButton::Left,
-                        };
-
-                        window.dispatch_event(pointer_event);
-                        println!(
-                            "Touch PRESSED at x={}, y={} (logical: {:.1}, {:.1}, scale_factor={})",
-                            touch_data.x,
-                            touch_data.y,
-                            logical_position.x,
-                            logical_position.y,
-                            window.scale_factor()
-                        );
-                    }
-                    // Touch release event (transition from Some to None)
-                    (Some(_), None) => {
-                        // Send PointerReleased at the last known position
-                        let pointer_released = WindowEvent::PointerReleased {
-                            position: last_touch_position,
-                            button: PointerEventButton::Left,
-                        };
-                        window.dispatch_event(pointer_released);
-
-                        // Also send PointerExited to complete the interaction cycle
-                        let pointer_exited = WindowEvent::PointerExited;
-                        window.dispatch_event(pointer_exited);
-
-                        println!(
-                            "Touch RELEASED at (logical: {:.1}, {:.1}) + EXITED",
-                            last_touch_position.x,
-                            last_touch_position.y
-                        );
-                    }
-                    // Touch move event (both states are Some but potentially different positions)
-                    (Some(old_touch), Some(new_touch)) => {
-                        // Only dispatch move event if position actually changed
-                        if old_touch.x != new_touch.x || old_touch.y != new_touch.y {
+            match display_hardware.touch.get_touch(&mut display_hardware.i2c) {
+                Ok(touch_data_option) => {
+                    match (last_touch_state.as_ref(), touch_data_option.as_ref()) {
+                        // Touch press event (transition from None to Some)
+                        (None, Some(touch_data)) => {
                             let physical_position =
-                                PhysicalPosition::new(new_touch.x as i32, new_touch.y as i32);
+                                PhysicalPosition::new(touch_data.x as i32, touch_data.y as i32);
                             let logical_position =
                                 physical_position.to_logical(window.scale_factor());
                             last_touch_position = logical_position;
 
-                            let pointer_event = WindowEvent::PointerMoved {
+                            let pointer_event = WindowEvent::PointerPressed {
                                 position: logical_position,
+                                button: PointerEventButton::Left,
                             };
 
                             window.dispatch_event(pointer_event);
                             println!(
-                                "Touch MOVED to x={}, y={} (logical: {:.1}, {:.1}, scale_factor={})",
-                                new_touch.x,
-                                new_touch.y,
+                                "Touch PRESSED at x={}, y={} (logical: {:.1}, {:.1}, scale_factor={})",
+                                touch_data.x,
+                                touch_data.y,
                                 logical_position.x,
                                 logical_position.y,
                                 window.scale_factor()
                             );
                         }
-                    }
-                    // No state change
-                    _ => {}
-                }
+                        // Touch release event (transition from Some to None)
+                        (Some(_), None) => {
+                            // Send PointerReleased at the last known position
+                            let pointer_released = WindowEvent::PointerReleased {
+                                position: last_touch_position,
+                                button: PointerEventButton::Left,
+                            };
+                            window.dispatch_event(pointer_released);
 
-                last_touch_state = touch_data_option;
+                            // Also send PointerExited to complete the interaction cycle
+                            let pointer_exited = WindowEvent::PointerExited;
+                            window.dispatch_event(pointer_exited);
+
+                            println!(
+                                "Touch RELEASED at (logical: {:.1}, {:.1}) + EXITED",
+                                last_touch_position.x,
+                                last_touch_position.y
+                            );
+                        }
+                        // Touch move event (both states are Some but potentially different positions)
+                        (Some(old_touch), Some(new_touch)) => {
+                            // Only dispatch move event if position actually changed
+                            if old_touch.x != new_touch.x || old_touch.y != new_touch.y {
+                                let physical_position =
+                                    PhysicalPosition::new(new_touch.x as i32, new_touch.y as i32);
+                                let logical_position =
+                                    physical_position.to_logical(window.scale_factor());
+                                last_touch_position = logical_position;
+
+                                let pointer_event = WindowEvent::PointerMoved {
+                                    position: logical_position,
+                                };
+
+                                window.dispatch_event(pointer_event);
+                                println!(
+                                    "Touch MOVED to x={}, y={} (logical: {:.1}, {:.1}, scale_factor={})",
+                                    new_touch.x,
+                                    new_touch.y,
+                                    logical_position.x,
+                                    logical_position.y,
+                                    window.scale_factor()
+                                );
+                            }
+                        }
+                        // No state change
+                        _ => {}
+                    }
+
+                    last_touch_state = touch_data_option;
+                }
+                Err(e) => {
+                    if status_counter % 600 == 0 {
+                        println!("Touch read error: {:?}", e);
+                    }
+                }
             }
         });
 
@@ -354,7 +370,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         }
 
         status_counter += 1;
-        touch_ticker.next().await;
+        // Ticker already awaited at top of loop
     }
 }
 
@@ -366,11 +382,13 @@ async fn graphics_task(
 ) {
     println!("=== Graphics rendering task started ====");
 
-    let mut ticker = Ticker::every(Duration::from_millis(16)); // ~60fps
+    // Match the display refresh rate of ~20fps
+    // Use 100ms (10fps) to give other tasks more CPU time since DMA transfer blocks for 55ms
+    let mut ticker = Ticker::every(Duration::from_millis(100)); // ~10fps to avoid blocking executor
     let mut frame_counter = 0u32;
 
     println!(
-        "Graphics task initialized for {}x{} rendering",
+        "Graphics task initialized for {}x{} rendering at ~20fps",
         LCD_H_RES, LCD_V_RES
     );
 
@@ -382,14 +400,14 @@ async fn graphics_task(
         if WIFI_SCAN_UPDATED.load(Ordering::Relaxed) {
             if let Some(ui_strong) = ui.upgrade() {
                 ui_strong.invoke_wifi_refresh();
+                window.request_redraw(); // Only request redraw when data changes
                 println!("Triggered UI refresh for new WiFi scan results");
             }
         }
 
-        // Render the frame to the PSRAM framebuffer
-        let rendered = window.draw_if_needed(|renderer| {
-            // Access the global display instance to get the framebuffer
-            if let Some(()) = DISPLAY_COMPONENTS.with_mut(|display_hardware| {
+        // Render the frame to the PSRAM framebuffer AND send via DMA atomically
+        let rendered = DISPLAY_COMPONENTS.with_mut(|display_hardware| {
+            window.draw_if_needed(|renderer| {
                 if let Some(framebuffer) = display_hardware.get_framebuffer() {
                     // Create a simple line buffer provider that writes to the PSRAM framebuffer
                     struct PSRAMLineBuffer<'a> {
@@ -408,7 +426,21 @@ async fn graphics_task(
                             let line_start = line * LCD_H_RES_USIZE;
                             let buffer_range = (line_start + range.start)..(line_start + range.end);
                             if buffer_range.end <= self.framebuffer.len() {
-                                render_fn(&mut self.framebuffer[buffer_range]);
+                                // Debug: Check what Slint is rendering on first line
+                                if line == 0 && range.start == 0 {
+                                    let before = self.framebuffer[buffer_range.start].0;
+                                    render_fn(&mut self.framebuffer[buffer_range.clone()]);
+                                    let after = self.framebuffer[buffer_range.start].0;
+                                    static mut FIRST_RENDER: bool = true;
+                                    unsafe {
+                                        if FIRST_RENDER {
+                                            println!("Slint rendering: pixel[0,0] before=0x{:04X}, after=0x{:04X}", before, after);
+                                            FIRST_RENDER = false;
+                                        }
+                                    }
+                                } else {
+                                    render_fn(&mut self.framebuffer[buffer_range]);
+                                }
                             }
                         }
                     }
@@ -416,39 +448,47 @@ async fn graphics_task(
                     let line_buffer = PSRAMLineBuffer { framebuffer };
                     renderer.render_by_line(line_buffer);
 
-                    if frame_counter % 60 == 0 {
+                    if frame_counter % 20 == 0 {
                         println!("Frame {} rendered to PSRAM framebuffer", frame_counter);
                     }
                 } else {
-                    println!("PSRAM framebuffer not available!");
+                    if frame_counter % 20 == 0 {
+                        println!("PSRAM framebuffer not available!");
+                    }
                 }
-            }) {
-                // Successfully rendered
-            } else {
-                println!("Display not available in graphics task!");
-            }
+            })
         });
 
-        // If a frame was rendered, log it
-        if rendered {
-            if frame_counter % 60 == 0 {
-                println!(
-                    "Frame {} rendered to PSRAM on ESP32-S3-Box-3",
-                    frame_counter
-                );
+        // Log if a frame was actually rendered
+        if rendered.expect("REASON") {
+            if frame_counter % 20 == 0 {
+                println!("Frame {} - Slint actually rendered (draw_if_needed returned true)", frame_counter);
+            }
+            
+            // Send the rendered frame to the display via DMA (still within same critical section conceptually)
+            if let Some(()) = DISPLAY_COMPONENTS.with_mut(|display_hardware| {
+                match display_hardware.send_frame() {
+                    Ok(()) => {
+                        if frame_counter % 20 == 0 {
+                            println!("Frame {} sent to display via DMA", frame_counter);
+                        }
+                    }
+                    Err(e) => {
+                        if frame_counter % 20 == 0 {
+                            println!("Frame {} DMA error: {}", frame_counter, e);
+                        }
+                    }
+                }
+            }) {} else {
+                println!("Display not available for DMA transfer!");
+            }
+        } else {
+            if frame_counter % 20 == 0 {
+                println!("Frame {} - Slint skipped render (no changes)", frame_counter);
             }
         }
 
         frame_counter = frame_counter.wrapping_add(1);
-
-        // Log periodic status
-        if frame_counter % 300 == 0 {
-            // Every ~5 seconds at 60fps
-            println!(
-                "Graphics: Frame {}, ESP32-S3-Box-3 rendering active",
-                frame_counter
-            );
-        }
 
         ticker.next().await;
     }
@@ -516,46 +556,5 @@ async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
     }
 }
 
-// Display DMA task - handles sending frames to the display
-#[embassy_executor::task]
-async fn display_dma_task() {
-    println!("=== Display DMA task started ====");
-
-    let mut ticker = Ticker::every(Duration::from_millis(16)); // ~60fps
-    let mut dma_frame_counter = 0u32;
-
-    loop {
-        // Send the current framebuffer to the display via DMA
-        if let Some(()) = DISPLAY_COMPONENTS.with_mut(|display_hardware| {
-            match display_hardware.send_frame() {
-                Ok(()) => {
-                    if dma_frame_counter % 60 == 0 {
-                        println!("DMA Frame {} sent to parallel LCD successfully", dma_frame_counter);
-                    }
-                }
-                Err(e) => {
-                    if dma_frame_counter % 60 == 0 {
-                        println!("DMA Frame {} - Display error: {}", dma_frame_counter, e);
-                    }
-                }
-            }
-        }) {
-            // Successfully processed
-        } else {
-            println!("Display not available in DMA task!");
-        }
-
-        dma_frame_counter = dma_frame_counter.wrapping_add(1);
-
-        // Log periodic status
-        if dma_frame_counter % 300 == 0 {
-            // Every ~5 seconds at 60fps
-            println!(
-                "DMA: Frame {}, ESP32-S3-Box-3 display DMA active",
-                dma_frame_counter
-            );
-        }
-
-        ticker.next().await;
-    }
-}
+// NOTE: DMA task removed - graphics task now handles both rendering AND DMA transfer
+// This avoids blocking the executor with synchronous DMA waits
